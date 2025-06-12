@@ -3329,3 +3329,197 @@ def convert_hidream_transformer_to_diffusers(checkpoint, **kwargs):
             checkpoint[k.replace("model.diffusion_model.", "")] = checkpoint.pop(k)
 
     return checkpoint
+
+
+# Add Ednaordinary's converter function
+def convert_chroma_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
+    """
+    Convert ChromaTransformer2DModel checkpoint to diffusers format.
+    This handles the conversion from original checkpoint format to the diffusers naming convention.
+    """
+    converted_state_dict = {}
+    keys = list(checkpoint.keys())
+    
+    # Handle model.diffusion_model prefix removal (common in many checkpoints)
+    for k in keys:
+        if "model.diffusion_model." in k:
+            checkpoint[k.replace("model.diffusion_model.", "")] = checkpoint.pop(k)
+    
+    # Handle distilled guidance layer conversion (similar to flux chroma variant)
+    variant = "chroma" if "distilled_guidance_layer.in_proj.weight" in checkpoint else "flux"
+    
+    for k in list(checkpoint.keys()):
+        if variant == "chroma" and "distilled_guidance_layer." in k:
+            new_key = k
+            if k.startswith("distilled_guidance_layer.norms"):
+                new_key = k.replace(".scale", ".weight")
+            elif k.startswith("distilled_guidance_layer.layer"):
+                new_key = k.replace("in_layer", "linear_1").replace("out_layer", "linear_2")
+            converted_state_dict[new_key] = checkpoint.pop(k)
+    
+    # Get number of layers from checkpoint
+    num_layers = 0
+    num_single_layers = 0
+    
+    if any("double_blocks." in k for k in checkpoint):
+        num_layers = list(set(int(k.split(".", 2)[1]) for k in checkpoint if "double_blocks." in k))[-1] + 1
+    if any("single_blocks." in k for k in checkpoint):
+        num_single_layers = list(set(int(k.split(".", 2)[1]) for k in checkpoint if "single_blocks." in k))[-1] + 1
+    
+    # Helper function to swap scale and shift for AdaLayerNorm
+    def swap_scale_shift(weight):
+        if weight.dim() == 1 and weight.size(0) % 2 == 0:
+            shift, scale = weight.chunk(2, dim=0)
+            new_weight = torch.cat([scale, shift], dim=0)
+            return new_weight
+        return weight
+    
+    # Convert time and text embeddings
+    if "time_in.in_layer.weight" in checkpoint:
+        converted_state_dict["time_text_embed.timestep_embedder.linear_1.weight"] = checkpoint.pop("time_in.in_layer.weight")
+        converted_state_dict["time_text_embed.timestep_embedder.linear_1.bias"] = checkpoint.pop("time_in.in_layer.bias")
+        converted_state_dict["time_text_embed.timestep_embedder.linear_2.weight"] = checkpoint.pop("time_in.out_layer.weight")
+        converted_state_dict["time_text_embed.timestep_embedder.linear_2.bias"] = checkpoint.pop("time_in.out_layer.bias")
+    
+    if "vector_in.in_layer.weight" in checkpoint:
+        converted_state_dict["time_text_embed.text_embedder.linear_1.weight"] = checkpoint.pop("vector_in.in_layer.weight")
+        converted_state_dict["time_text_embed.text_embedder.linear_1.bias"] = checkpoint.pop("vector_in.in_layer.bias")
+        converted_state_dict["time_text_embed.text_embedder.linear_2.weight"] = checkpoint.pop("vector_in.out_layer.weight")
+        converted_state_dict["time_text_embed.text_embedder.linear_2.bias"] = checkpoint.pop("vector_in.out_layer.bias")
+    
+    # Convert guidance embeddings if present
+    if "guidance_in.in_layer.weight" in checkpoint:
+        converted_state_dict["time_text_embed.guidance_embedder.linear_1.weight"] = checkpoint.pop("guidance_in.in_layer.weight")
+        converted_state_dict["time_text_embed.guidance_embedder.linear_1.bias"] = checkpoint.pop("guidance_in.in_layer.bias")
+        converted_state_dict["time_text_embed.guidance_embedder.linear_2.weight"] = checkpoint.pop("guidance_in.out_layer.weight")
+        converted_state_dict["time_text_embed.guidance_embedder.linear_2.bias"] = checkpoint.pop("guidance_in.out_layer.bias")
+    
+    # Convert context and x embedders
+    if "txt_in.weight" in checkpoint:
+        converted_state_dict["context_embedder.weight"] = checkpoint.pop("txt_in.weight")
+        converted_state_dict["context_embedder.bias"] = checkpoint.pop("txt_in.bias")
+    
+    if "img_in.weight" in checkpoint:
+        converted_state_dict["x_embedder.weight"] = checkpoint.pop("img_in.weight")
+        converted_state_dict["x_embedder.bias"] = checkpoint.pop("img_in.bias")
+    
+    # Convert double transformer blocks
+    for i in range(num_layers):
+        block_prefix = f"transformer_blocks.{i}."
+        
+        # Convert norms
+        if f"double_blocks.{i}.img_mod.lin.weight" in checkpoint:
+            converted_state_dict[f"{block_prefix}norm1.linear.weight"] = checkpoint.pop(f"double_blocks.{i}.img_mod.lin.weight")
+            converted_state_dict[f"{block_prefix}norm1.linear.bias"] = checkpoint.pop(f"double_blocks.{i}.img_mod.lin.bias")
+        
+        if f"double_blocks.{i}.txt_mod.lin.weight" in checkpoint:
+            converted_state_dict[f"{block_prefix}norm1_context.linear.weight"] = checkpoint.pop(f"double_blocks.{i}.txt_mod.lin.weight")
+            converted_state_dict[f"{block_prefix}norm1_context.linear.bias"] = checkpoint.pop(f"double_blocks.{i}.txt_mod.lin.bias")
+        
+        # Convert attention layers
+        if f"double_blocks.{i}.img_attn.qkv.weight" in checkpoint:
+            sample_q, sample_k, sample_v = torch.chunk(checkpoint.pop(f"double_blocks.{i}.img_attn.qkv.weight"), 3, dim=0)
+            sample_q_bias, sample_k_bias, sample_v_bias = torch.chunk(checkpoint.pop(f"double_blocks.{i}.img_attn.qkv.bias"), 3, dim=0)
+            
+            converted_state_dict[f"{block_prefix}attn.to_q.weight"] = sample_q
+            converted_state_dict[f"{block_prefix}attn.to_q.bias"] = sample_q_bias
+            converted_state_dict[f"{block_prefix}attn.to_k.weight"] = sample_k
+            converted_state_dict[f"{block_prefix}attn.to_k.bias"] = sample_k_bias
+            converted_state_dict[f"{block_prefix}attn.to_v.weight"] = sample_v
+            converted_state_dict[f"{block_prefix}attn.to_v.bias"] = sample_v_bias
+        
+        if f"double_blocks.{i}.txt_attn.qkv.weight" in checkpoint:
+            context_q, context_k, context_v = torch.chunk(checkpoint.pop(f"double_blocks.{i}.txt_attn.qkv.weight"), 3, dim=0)
+            context_q_bias, context_k_bias, context_v_bias = torch.chunk(checkpoint.pop(f"double_blocks.{i}.txt_attn.qkv.bias"), 3, dim=0)
+            
+            converted_state_dict[f"{block_prefix}attn.add_q_proj.weight"] = context_q
+            converted_state_dict[f"{block_prefix}attn.add_q_proj.bias"] = context_q_bias
+            converted_state_dict[f"{block_prefix}attn.add_k_proj.weight"] = context_k
+            converted_state_dict[f"{block_prefix}attn.add_k_proj.bias"] = context_k_bias
+            converted_state_dict[f"{block_prefix}attn.add_v_proj.weight"] = context_v
+            converted_state_dict[f"{block_prefix}attn.add_v_proj.bias"] = context_v_bias
+        
+        # Convert QK norms
+        if f"double_blocks.{i}.img_attn.norm.query_norm.scale" in checkpoint:
+            converted_state_dict[f"{block_prefix}attn.norm_q.weight"] = checkpoint.pop(f"double_blocks.{i}.img_attn.norm.query_norm.scale")
+            converted_state_dict[f"{block_prefix}attn.norm_k.weight"] = checkpoint.pop(f"double_blocks.{i}.img_attn.norm.key_norm.scale")
+        
+        if f"double_blocks.{i}.txt_attn.norm.query_norm.scale" in checkpoint:
+            converted_state_dict[f"{block_prefix}attn.norm_added_q.weight"] = checkpoint.pop(f"double_blocks.{i}.txt_attn.norm.query_norm.scale")
+            converted_state_dict[f"{block_prefix}attn.norm_added_k.weight"] = checkpoint.pop(f"double_blocks.{i}.txt_attn.norm.key_norm.scale")
+        
+        # Convert output projections
+        if f"double_blocks.{i}.img_attn.proj.weight" in checkpoint:
+            converted_state_dict[f"{block_prefix}attn.to_out.0.weight"] = checkpoint.pop(f"double_blocks.{i}.img_attn.proj.weight")
+            converted_state_dict[f"{block_prefix}attn.to_out.0.bias"] = checkpoint.pop(f"double_blocks.{i}.img_attn.proj.bias")
+        
+        if f"double_blocks.{i}.txt_attn.proj.weight" in checkpoint:
+            converted_state_dict[f"{block_prefix}attn.to_add_out.weight"] = checkpoint.pop(f"double_blocks.{i}.txt_attn.proj.weight")
+            converted_state_dict[f"{block_prefix}attn.to_add_out.bias"] = checkpoint.pop(f"double_blocks.{i}.txt_attn.proj.bias")
+        
+        # Convert MLPs
+        if f"double_blocks.{i}.img_mlp.0.weight" in checkpoint:
+            converted_state_dict[f"{block_prefix}ff.net.0.proj.weight"] = checkpoint.pop(f"double_blocks.{i}.img_mlp.0.weight")
+            converted_state_dict[f"{block_prefix}ff.net.0.proj.bias"] = checkpoint.pop(f"double_blocks.{i}.img_mlp.0.bias")
+            converted_state_dict[f"{block_prefix}ff.net.2.weight"] = checkpoint.pop(f"double_blocks.{i}.img_mlp.2.weight")
+            converted_state_dict[f"{block_prefix}ff.net.2.bias"] = checkpoint.pop(f"double_blocks.{i}.img_mlp.2.bias")
+        
+        if f"double_blocks.{i}.txt_mlp.0.weight" in checkpoint:
+            converted_state_dict[f"{block_prefix}ff_context.net.0.proj.weight"] = checkpoint.pop(f"double_blocks.{i}.txt_mlp.0.weight")
+            converted_state_dict[f"{block_prefix}ff_context.net.0.proj.bias"] = checkpoint.pop(f"double_blocks.{i}.txt_mlp.0.bias")
+            converted_state_dict[f"{block_prefix}ff_context.net.2.weight"] = checkpoint.pop(f"double_blocks.{i}.txt_mlp.2.weight")
+            converted_state_dict[f"{block_prefix}ff_context.net.2.bias"] = checkpoint.pop(f"double_blocks.{i}.txt_mlp.2.bias")
+    
+    # Convert single transformer blocks
+    for i in range(num_single_layers):
+        block_prefix = f"single_transformer_blocks.{i}."
+        
+        # Convert norms
+        if f"single_blocks.{i}.modulation.lin.weight" in checkpoint:
+            converted_state_dict[f"{block_prefix}norm.linear.weight"] = checkpoint.pop(f"single_blocks.{i}.modulation.lin.weight")
+            converted_state_dict[f"{block_prefix}norm.linear.bias"] = checkpoint.pop(f"single_blocks.{i}.modulation.lin.bias")
+        
+        # Convert combined QKV and MLP
+        if f"single_blocks.{i}.linear1.weight" in checkpoint:
+            inner_dim = 3072
+            mlp_ratio = 4.0
+            mlp_hidden_dim = int(inner_dim * mlp_ratio)
+            split_size = (inner_dim, inner_dim, inner_dim, mlp_hidden_dim)
+            
+            q, k, v, mlp = torch.split(checkpoint.pop(f"single_blocks.{i}.linear1.weight"), split_size, dim=0)
+            q_bias, k_bias, v_bias, mlp_bias = torch.split(checkpoint.pop(f"single_blocks.{i}.linear1.bias"), split_size, dim=0)
+            
+            converted_state_dict[f"{block_prefix}attn.to_q.weight"] = q
+            converted_state_dict[f"{block_prefix}attn.to_q.bias"] = q_bias
+            converted_state_dict[f"{block_prefix}attn.to_k.weight"] = k
+            converted_state_dict[f"{block_prefix}attn.to_k.bias"] = k_bias
+            converted_state_dict[f"{block_prefix}attn.to_v.weight"] = v
+            converted_state_dict[f"{block_prefix}attn.to_v.bias"] = v_bias
+            converted_state_dict[f"{block_prefix}proj_mlp.weight"] = mlp
+            converted_state_dict[f"{block_prefix}proj_mlp.bias"] = mlp_bias
+        
+        # Convert QK norms
+        if f"single_blocks.{i}.norm.query_norm.scale" in checkpoint:
+            converted_state_dict[f"{block_prefix}attn.norm_q.weight"] = checkpoint.pop(f"single_blocks.{i}.norm.query_norm.scale")
+            converted_state_dict[f"{block_prefix}attn.norm_k.weight"] = checkpoint.pop(f"single_blocks.{i}.norm.key_norm.scale")
+        
+        # Convert output projection
+        if f"single_blocks.{i}.linear2.weight" in checkpoint:
+            converted_state_dict[f"{block_prefix}proj_out.weight"] = checkpoint.pop(f"single_blocks.{i}.linear2.weight")
+            converted_state_dict[f"{block_prefix}proj_out.bias"] = checkpoint.pop(f"single_blocks.{i}.linear2.bias")
+    
+    # Convert final layer
+    if "final_layer.linear.weight" in checkpoint:
+        converted_state_dict["proj_out.weight"] = checkpoint.pop("final_layer.linear.weight")
+        converted_state_dict["proj_out.bias"] = checkpoint.pop("final_layer.linear.bias")
+    
+    if "final_layer.adaLN_modulation.1.weight" in checkpoint:
+        converted_state_dict["norm_out.linear.weight"] = swap_scale_shift(checkpoint.pop("final_layer.adaLN_modulation.1.weight"))
+        converted_state_dict["norm_out.linear.bias"] = swap_scale_shift(checkpoint.pop("final_layer.adaLN_modulation.1.bias"))
+    
+    # Add any remaining keys from the original checkpoint
+    for key, value in checkpoint.items():
+        if key not in converted_state_dict:
+            converted_state_dict[key] = value
+    
+    return converted_state_dict
